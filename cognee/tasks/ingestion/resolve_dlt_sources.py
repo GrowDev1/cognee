@@ -331,6 +331,11 @@ async def _delete_dlt_orphans(
     from cognee.modules.graph.methods.delete_data_nodes_and_edges import (
         delete_data_nodes_and_edges,
     )
+    from cognee.modules.graph.methods.try_delete_data_by_graph_provenance import (
+        try_delete_data_by_graph_provenance,
+    )
+    from cognee.modules.graph.methods.legacy_delete import legacy_delete
+    from cognee.context_global_variables import set_database_global_context_variables
 
     # Find the dataset — if it doesn't exist yet this is a first ingestion,
     # so there can be no orphans.
@@ -361,18 +366,27 @@ async def _delete_dlt_orphans(
     )
 
     failed: list = []
-    for orphan in orphans:
-        try:
-            if await has_data_related_nodes(dataset.id, orphan.id):
-                await delete_data_nodes_and_edges(dataset.id, orphan.id, user.id)
-            await delete_data(orphan, dataset.id)
-        except Exception:
-            failed.append(orphan.id)
-            logger.warning(
-                "Failed to delete orphaned dlt row data_id=%s, skipping.",
-                orphan.id,
-                exc_info=True,
-            )
+    # Mirror the canonical delete routing (datasets.delete_data) so orphaned dlt
+    # rows are purged from the graph + vector stores, not just the relational one.
+    # A ledger-only gate (has_data_related_nodes) skips graph/vector deletion on
+    # graph-provenance stacks (the Ladybug default), where provenance lives in the
+    # graph rather than the ledger — leaving deleted rows searchable. The graph +
+    # vector engines are dataset-scoped, so run inside the dataset DB context.
+    async with set_database_global_context_variables(dataset.id, dataset.owner_id):
+        for orphan in orphans:
+            try:
+                if await has_data_related_nodes(dataset.id, orphan.id):
+                    await delete_data_nodes_and_edges(dataset.id, orphan.id, user.id)
+                elif not await try_delete_data_by_graph_provenance(dataset.id, orphan.id):
+                    await legacy_delete(orphan, "soft")
+                await delete_data(orphan, dataset.id)
+            except Exception:
+                failed.append(orphan.id)
+                logger.warning(
+                    "Failed to delete orphaned dlt row data_id=%s, skipping.",
+                    orphan.id,
+                    exc_info=True,
+                )
 
     if failed:
         # Surface partial-cleanup failures loudly: the stale rows remain across
