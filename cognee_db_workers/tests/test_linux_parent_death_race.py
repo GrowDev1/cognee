@@ -1,6 +1,14 @@
-"""Tests for the POSIX parent-death ARM-WINDOW race in `run_worker_loop`.
+"""Tests for the two POSIX parent-death gaps in `run_worker_loop`.
 
-Root cause this fixes: `set_pdeathsig()` arms `prctl(PR_SET_PDEATHSIG,
+Both end the same way -- a worker orphaned forever holding an exclusive
+Kuzu/LanceDB lock -- but they are distinct bugs with distinct fixes:
+
+* the ARM-WINDOW race (`TestArmWindowRace`), where the parent dies before the
+  child can arm anything at all; and
+* the FORKSERVER ANCHOR gap (`TestForkserverAnchorGap`, added 2026-07-29),
+  where everything arms successfully and still points at the wrong process.
+
+Root cause of the first: `set_pdeathsig()` arms `prctl(PR_SET_PDEATHSIG,
 SIGTERM)` from INSIDE the child, at the top of `run_worker_loop`.
 `PR_SET_PDEATHSIG` is not retroactive -- it only fires for a parent death that
 happens AFTER the prctl call. Workers here are `spawn`-started, so there is a
@@ -12,6 +20,17 @@ which SUPPRESSES the `start_parent_liveness_watchdog()` fallback at the call
 site. Net result: an orphaned worker holding an exclusive Kuzu/LanceDB lock
 forever. This is the POSIX twin of the Windows orphan incident that
 `test_windows_parent_death_watchdog.py` covers.
+
+Root cause of the second: `prctl(PR_SET_PDEATHSIG)` anchors to the caller's
+**OS** parent. Under `forkserver` that is the FORK SERVER, not the launching
+process, and the fork server outlives a launching process that dies -- it is
+merely reparented -- so the signal never arrives even though prctl armed
+successfully and reported success. The pre-existing portable fallback cannot
+cover for it either: `start_parent_liveness_watchdog` polls `os.getppid()`,
+which resolves to that same still-alive fork server. Fixed by
+`start_parent_sentinel_watchdog`, which polls the multiprocessing parent
+sentinel -- the signal that reads the REAL parent's death correctly, and the one
+`parent_already_exited` already trusts at startup.
 
 Why these tests are structured the way they are:
 
@@ -162,6 +181,37 @@ def _proc_identity(pid: int):
         return fields[0].decode(), fields[19].decode()
     except (ValueError, IndexError):
         return None
+
+
+def _os_parent_pid(pid: int):
+    """Field 4 (``ppid``) of ``/proc/<pid>/stat`` — the process prctl anchors to.
+
+    Same parsing rules as ``_proc_identity``: tokens start at field 3, so field
+    N sits at index ``N - 3`` and ppid is index 1. Used to ASSERT the forkserver
+    anchoring divergence was actually present in a given run rather than
+    assuming the start method behaved as expected — the test for a bug caused by
+    a wrong anchor must not itself take the anchor on faith.
+    """
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as fh:
+            raw = fh.read()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+    try:
+        return int(raw[raw.rindex(b")") + 1 :].split()[1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _watchdog_thread_count() -> int:
+    """How many sentinel-watchdog threads are live in THIS process right now.
+
+    Tests assert on the DELTA across a test, never on an absolute zero: a
+    mutant that wrongly starts a watcher leaks a daemon thread that outlives
+    the test which started it, and an absolute assertion would then fail every
+    later test too, destroying the attribution a mutation run depends on.
+    """
+    return sum(1 for t in threading.enumerate() if t.name == "parent-sentinel-watchdog")
 
 
 def _require_identity(pid: int) -> str:
@@ -408,6 +458,22 @@ class TestNormalPathNotRegressed:
 
     No characterization test asserts the survival above: doing so would lock
     the bug in and go red the day someone fixes it properly.
+
+    SUPERSEDED 2026-07-29 -- state as of `0ccdc608e`. Everything above is still
+    an accurate account of the MEASUREMENT, and the "out of scope here" /
+    "latent, not live" framing was true when written. It is no longer the state
+    of the code: that day arrived. `start_parent_sentinel_watchdog` closes the
+    anchoring gap, and `TestForkserverAnchorGap` below is the test the last
+    paragraph declined to write -- it asserts the OPPOSITE of the trace above,
+    which is exactly why writing it then would have locked the bug in. The
+    survival trace is retained deliberately: it is the control measurement that
+    makes the inverted assertion meaningful, and re-measuring it is how the fix
+    was verified rather than assumed.
+
+    This class keeps its `spawn`-only parametrisation. The mechanism it guards
+    is prctl itself, which under forkserver is genuinely not what does the work
+    -- adding forkserver here would silently retarget the test at the sentinel
+    watchdog while its name still claimed to cover the kernel signal path.
     """
 
     @pytest.mark.parametrize("method", ["spawn"])
@@ -442,6 +508,104 @@ class TestNormalPathNotRegressed:
         finally:
             if worker_pid is not None:
                 _reap(worker_pid)
+            if parent.poll() is None:
+                parent.kill()
+
+
+class TestForkserverAnchorGap:
+    """The SECOND bug: everything arms, and still points at the wrong process.
+
+    This is `TestNormalPathNotRegressed`'s recorded survival trace, inverted.
+    Same scenario in every respect -- worker fully up, READY observed, so prctl
+    armed successfully and returned True -- differing only in the start method.
+    Under `spawn` the worker dies in ~0.1s; under `forkserver` it used to
+    survive indefinitely, because `prctl(PR_SET_PDEATHSIG)` anchors to the OS
+    parent and under forkserver that is the fork server, which is merely
+    reparented when the launching process dies. Measured on WSL Ubuntu / CPython
+    3.14.4 against the code as of `0ccdc608e`, launching process SIGKILLing
+    itself 3s after READY::
+
+        method=spawn       worker=6401  anchor=6399 == launching process
+                           RESULT: worker DIED 0.00s after the parent's SIGKILL
+        method=fork        worker=6406  anchor=6405 == launching process
+                           RESULT: worker DIED 0.10s after the parent's SIGKILL
+        method=forkserver  worker=6413  anchor=6412 != launching process 6410
+                           t= 0.0 .. 18.0  worker=alive  anchor_alive=True
+                           RESULT: SURVIVED the full 20s  <-- ORPHANED WORKER
+
+    Note what makes this gap worse than it looks: the portable fallback is not
+    a fallback here. `start_parent_liveness_watchdog` polls `os.getppid()` --
+    the fork server -- so it reports "parent fine" for precisely this death.
+    Before `start_parent_sentinel_watchdog` there was no second line of defence
+    at all.
+
+    LATENT, NOT LIVE, at the time of writing, and the test exists anyway: both
+    production spawn sites pin `mp.get_context("spawn")` unconditionally
+    (kuzu and lancedb `subprocess/proxy.py`). That is a thin guarantee -- one
+    new `Process(...)` with no explicit context under Python 3.14 on Linux, where
+    `forkserver` is the DEFAULT, makes it live. This test is what stops that
+    one-line change from silently reintroducing an orphaned-lock outage.
+    """
+
+    @pytest.mark.parametrize("method", ["forkserver"])
+    def test_worker_exits_when_parent_dies_and_pdeathsig_anchors_elsewhere(
+        self, tmp_path, method
+    ):
+        script = _write_parent_script(tmp_path, method=method, kill_mode="after_arm", stall=0.0)
+        parent = _launch_parent(script)
+        worker_pid = None
+        starttime = None
+        try:
+            reader = _LineReader(parent)
+            line = reader.next_line()
+            assert line.startswith("PID "), f"unexpected first line from parent: {line!r}"
+            worker_pid = int(line.split()[1])
+            starttime = _require_identity(worker_pid)
+
+            # SETUP ASSERTION, not a behavioural one. The bug under test is
+            # "prctl anchors to the wrong process", so the run is only
+            # meaningful if the anchor really was wrong in THIS run. Asserting
+            # it rather than trusting the start method also means that if a
+            # future CPython makes forkserver children direct children of the
+            # launching process, this fails loudly as an invalid setup instead
+            # of passing vacuously via the spawn code path.
+            anchor = _os_parent_pid(worker_pid)
+            assert anchor is not None, "worker vanished before its anchor could be read"
+            assert anchor != parent.pid, (
+                f"[{method}] worker's OS parent is {anchor}, which IS the launching process "
+                f"{parent.pid} -- the forkserver anchoring divergence this test targets did "
+                "not occur, so a pass here would prove nothing about the sentinel watchdog."
+            )
+
+            # READY proves the worker is fully up and past the arming block, so
+            # pdeathsig armed and returned True before the parent died. This is
+            # NOT the arm-window race.
+            assert reader.next_line() == "READY"
+            assert reader.next_line() == "KILLING_SELF"
+            parent.wait(timeout=15)
+            assert parent.returncode == -signal.SIGKILL, (
+                f"parent did not die by SIGKILL (returncode={parent.returncode}); "
+                "the scenario was never actually set up"
+            )
+
+            # The control measurement above ran for 20s and saw no death, so a
+            # 25s budget is decisive rather than merely generous.
+            deadline = time.monotonic() + 25.0
+            while time.monotonic() < deadline:
+                if _is_gone(worker_pid, starttime):
+                    return
+                time.sleep(0.1)
+            pytest.fail(
+                f"[{method}] worker pid {worker_pid} SURVIVED 25s after its parent was "
+                "SIGKILLed, with pdeathsig armed the whole time. prctl anchored to the fork "
+                f"server ({anchor}), which outlives the launching process, and "
+                "start_parent_liveness_watchdog polls that same pid so it cannot notice "
+                "either. This is the orphaned-worker-holding-a-DB-lock bug via the anchoring "
+                "door: start_parent_sentinel_watchdog is what is supposed to catch it."
+            )
+        finally:
+            if worker_pid is not None:
+                _reap(worker_pid, starttime)
             if parent.poll() is None:
                 parent.kill()
 
@@ -539,3 +703,301 @@ class TestParentAlreadyExitedUnitSemantics:
             f"invalid fd yielded {got!r}; False would be read as 'parent dead' "
             "and kill a worker whose parent is fine"
         )
+
+
+class TestSentinelWatchdogUnitSemantics:
+    """Fail-safe contract of the anchoring / sentinel-watchdog helpers.
+
+    The live-subprocess test above proves the watchdog FIRES. These prove the
+    much more dangerous direction -- that it does not fire when it must not.
+    A false positive here is `os._exit(0)` on a healthy worker, i.e. an outage,
+    and none of the failure modes below are reachable from a spawn test.
+
+    Every stub parent below reports `is_alive() -> True`. That is a safety
+    property of the test suite, not an incidental detail: under a MUTANT that
+    lets an unwanted watcher start, the thread is real and polls inside the
+    pytest process, so a stub that read "dead" would `os._exit(0)` the test
+    runner itself and report as a crash rather than a failure.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_watchdog_state(self):
+        """Per-test isolation of the module-global watchdog state.
+
+        Added 2026-07-29 after a mutation run: a mutant that wrongly starts a
+        watcher leaks BOTH the module flag and a live daemon thread into every
+        later test, so mutating one guard turned three unrelated tests red and
+        the evidence stopped being attributable. Tests here must fail for their
+        own reason or the mutation signal is worthless.
+        """
+        from cognee_db_workers import harness
+
+        saved = harness._sentinel_watchdog_started
+        self._thread_baseline = _watchdog_thread_count()
+        try:
+            yield
+        finally:
+            harness._sentinel_watchdog_started = saved
+
+    def assert_no_new_watchdog_thread(self, why: str) -> None:
+        """No watcher thread was started BY THIS TEST (delta, not absolute)."""
+        now = _watchdog_thread_count()
+        assert now == self._thread_baseline, (
+            f"{why} (watcher threads: {self._thread_baseline} before, {now} after)"
+        )
+
+    def test_anchor_is_unknown_outside_a_multiprocessing_child(self):
+        """No baseline means no claim -- not "mismatched"."""
+        from cognee_db_workers import harness
+
+        # The main process is not a multiprocessing child, so there is no real
+        # parent to compare getppid() against.
+        assert harness.get_original_parent_pid() is None
+        assert harness.pdeathsig_anchor_is_real_parent() is None
+
+    def test_anchor_compares_getppid_to_the_real_parent(self, monkeypatch):
+        """True only when the OS parent IS the launching process.
+
+        Both directions matter. A function stuck at True would silently skip the
+        watchdog and leave the forkserver gap open; one stuck at False would
+        start a redundant polling thread under spawn/fork. Measured on WSL
+        Ubuntu / CPython 3.14.4 with the parent alive throughout::
+
+            spawn        parent_process().pid=6319  getppid()=6319  -> True
+            fork         parent_process().pid=6319  getppid()=6319  -> True
+            forkserver   parent_process().pid=6319  getppid()=6325  -> False
+        """
+        from cognee_db_workers import harness
+
+        monkeypatch.setattr(harness, "get_original_parent_pid", lambda: os.getppid())
+        assert harness.pdeathsig_anchor_is_real_parent() is True
+
+        bogus = os.getppid() + 1000000
+        monkeypatch.setattr(harness, "get_original_parent_pid", lambda: bogus)
+        assert harness.pdeathsig_anchor_is_real_parent() is False
+
+    def test_watchdog_reports_false_when_there_is_nothing_to_watch(self):
+        """Returning True while watching nothing is the lie this file exists to kill.
+
+        In the main process there is no multiprocessing parent and therefore no
+        sentinel, so the watchdog must decline to start AND say so. Reporting
+        success here would reproduce, one layer down, exactly the
+        `set_pdeathsig()` -> True -> fallback-suppressed failure that made the
+        forkserver gap invisible in the first place.
+        """
+        from cognee_db_workers import harness
+
+        assert harness.start_parent_sentinel_watchdog() is False
+        assert not any(
+            t.name == "parent-sentinel-watchdog" for t in threading.enumerate()
+        ), "a watcher thread was started even though there is no sentinel to watch"
+
+    @pytest.mark.parametrize("verdict", [True, None])
+    def test_only_a_confirmed_dead_sentinel_counts_as_death(self, monkeypatch, verdict):
+        """Alive AND unknown must both yield False. Only False means dead."""
+        from cognee_db_workers import harness
+
+        monkeypatch.setattr(harness, "_parent_sentinel_alive", lambda: verdict)
+        assert harness._sentinel_confirms_parent_dead(None) is False
+        assert harness._sentinel_confirms_parent_dead((1, 2)) is False
+
+    def test_confirmed_dead_with_matching_identity_is_death(self, monkeypatch):
+        """The one case that MAY kill: corroborated dead AND identity matches."""
+        from cognee_db_workers import harness
+
+        monkeypatch.setattr(harness, "_parent_sentinel_alive", lambda: False)
+        monkeypatch.setattr(harness, "_parent_sentinel_identity", lambda: (7, 42))
+        assert harness._sentinel_confirms_parent_dead((7, 42)) is True
+
+    def test_unpinned_is_never_death_even_when_the_sentinel_says_dead(self, monkeypatch):
+        """No pin means the recycled-fd case cannot be ruled out -> not dead.
+
+        INVERTED 2026-07-29. This assertion previously read `is True`, with the
+        rationale that falling back to `_parent_sentinel_alive()`'s own
+        corroboration was "never weaker than what parent_already_exited does at
+        startup". That was a category error: parent_already_exited is ONE-SHOT
+        at startup, the watchdog POLLS FOREVER. Same reading, different
+        exposure. A passing test asserting `is True` did not make the behaviour
+        safe -- it enshrined the hole and made it look deliberate, which is
+        worse than leaving it uncovered.
+
+        Note this test goes red against BOTH directions of the bug: a `True`
+        here is the outage, and it is the exact value the code used to return.
+        """
+        from cognee_db_workers import harness
+
+        monkeypatch.setattr(harness, "_parent_sentinel_alive", lambda: False)
+        monkeypatch.setattr(harness, "_parent_sentinel_identity", lambda: (7, 42))
+        assert harness._sentinel_confirms_parent_dead(None) is False, (
+            "an unpinnable sentinel was read as a parent death; this is os._exit(0) "
+            "on a worker whose parent is perfectly healthy"
+        )
+
+    def test_watchdog_refuses_to_start_when_the_fd_cannot_be_pinned(self, monkeypatch):
+        """An unpinned watcher can never fire, so it must never exist.
+
+        Second half of the same fix. Without this, `start_parent_sentinel_watchdog`
+        checked only that `_sentinel` was not None and would happily run
+        permanently unpinned. Declining is strictly better than a thread that
+        polls forever and cannot act -- a protection that exists only on paper.
+        """
+        import multiprocessing
+
+        from cognee_db_workers import harness
+
+        class _Parent:
+            _sentinel = 0
+
+            def is_alive(self):
+                return True
+
+        monkeypatch.setattr(multiprocessing, "parent_process", lambda: _Parent())
+        monkeypatch.setattr(harness, "_parent_sentinel_identity", lambda: None)
+        assert harness.start_parent_sentinel_watchdog() is False
+        self.assert_no_new_watchdog_thread("a permanently-unpinned watcher thread was started")
+
+    def test_watchdog_is_posix_only_by_enforcement_not_by_accident(self, monkeypatch):
+        """Windows must be refused by the explicit guard, not by circumstance.
+
+        `_parent_sentinel_identity` returns None on Windows BY DESIGN (`_sentinel`
+        is a process HANDLE, not an fd), so a Windows watcher could only ever be
+        the unpinned kind. Before the explicit guard the POSIX scoping held only
+        because `run_worker_loop` happened never to reach it there -- true, but
+        unenforced, and one new caller away from being false. Mirrors
+        `parent_already_exited`, which opens with the same check.
+
+        CORRECTED 2026-07-29 -- this test was WORTHLESS as first written. It set
+        `platform` and asserted False, but in the main pytest process
+        `parent_process()` is None, so it returned False via the "nothing to
+        watch" path and never reached the win32 guard at all. A mutation run
+        that DELETED the guard left this test GREEN, which is how it was caught:
+        mutation proves a guard is load-bearing, never that it was consulted.
+        Now every other exit is stubbed out -- valid parent, valid sentinel,
+        successful pin -- so the win32 check is the ONLY thing left that can
+        return False, and deleting it makes this go red.
+        """
+        import multiprocessing
+
+        from cognee_db_workers import harness
+
+        class _Parent:
+            _sentinel = 0
+
+            def is_alive(self):
+                return True  # never let a mutant-started thread exit pytest
+
+        monkeypatch.setattr(multiprocessing, "parent_process", lambda: _Parent())
+        monkeypatch.setattr(harness, "_parent_sentinel_identity", lambda: (7, 42))
+        monkeypatch.setattr(harness, "_sentinel_watchdog_started", False)
+        # Sanity: with POSIX these stubs DO start a watcher, so the win32 result
+        # below is attributable to the guard and nothing else. This deliberately
+        # leaks ONE daemon thread for the rest of the session -- the watchdog has
+        # no stop signal by design (it is meant to outlive everything until the
+        # process dies). It is inert: once monkeypatch unwinds, its pinned
+        # identity can never match, so `_sentinel_confirms_parent_dead` returns
+        # False forever. This is why the assertions here and in the sibling tests
+        # count a DELTA rather than asserting an absolute zero.
+        monkeypatch.setattr(harness.sys, "platform", "linux")
+        assert harness.start_parent_sentinel_watchdog() is True, (
+            "the stubs do not reach the start path, so this test cannot isolate "
+            "the win32 guard -- fix the stubs, not the assertion"
+        )
+
+        monkeypatch.setattr(harness, "_sentinel_watchdog_started", False)
+        monkeypatch.setattr(harness.sys, "platform", "win32")
+        before = _watchdog_thread_count()
+        assert harness.start_parent_sentinel_watchdog() is False, (
+            "the win32 guard is absent: Windows would run a permanently-unpinned "
+            "watcher, since _parent_sentinel_identity returns None there by design"
+        )
+        assert _watchdog_thread_count() == before, "a watcher was started on win32"
+
+    def test_watchdog_is_idempotent(self, monkeypatch):
+        """Re-entering run_worker_loop must not accumulate watcher threads."""
+        from cognee_db_workers import harness
+
+        monkeypatch.setattr(harness, "_sentinel_watchdog_started", True)
+        # Reports True -- a watcher IS running -- without starting a second one,
+        # so the caller's "did this leave me unprotected?" check stays correct.
+        assert harness.start_parent_sentinel_watchdog() is True
+        self.assert_no_new_watchdog_thread("idempotence guard did not prevent a second thread")
+
+    def test_recycled_sentinel_fd_is_not_read_as_parent_death(self, monkeypatch):
+        """The failure mode the identity pin exists for.
+
+        `_parent_sentinel_alive()` corroborates a "dead" answer by checking the
+        fd is still VALID, which rejects a CLOSED fd. It cannot reject a
+        RECYCLED one: if the sentinel fd is closed and a later open() is handed
+        the same fd NUMBER, fstat succeeds, poll() on a regular file always
+        reports readable, and is_alive() returns False for a perfectly healthy
+        parent -- a fully corroborated, completely wrong "dead".
+
+        As a one-shot startup check that window is narrow. The watchdog polls
+        for the worker's whole life, so it gets the pin instead: a sentinel
+        whose identity no longer matches the one captured at start is UNKNOWN,
+        never dead.
+        """
+        from cognee_db_workers import harness
+
+        monkeypatch.setattr(harness, "_parent_sentinel_alive", lambda: False)
+        monkeypatch.setattr(harness, "_parent_sentinel_identity", lambda: (7, 99))
+        assert harness._sentinel_confirms_parent_dead((7, 42)) is False, (
+            "a recycled sentinel fd was read as a parent death; this kills a worker "
+            "whose parent is perfectly healthy"
+        )
+
+    def test_recycled_sentinel_fd_with_REAL_fds_and_the_real_is_alive(self, monkeypatch):
+        """The same failure, measured rather than simulated.
+
+        The test above stubs `_parent_sentinel_alive`, so it proves the
+        predicate's arithmetic but takes the premise on faith. This one builds
+        the situation out of real file descriptors and calls the REAL
+        `multiprocessing.process._ParentProcess.is_alive()` -- the same code path
+        a live worker runs -- so it also proves the premise: that a recycled fd
+        genuinely does read as "parent dead" while the parent is alive.
+
+        `os.dup2` is what makes it deterministic: it forces a DIFFERENT open file
+        description onto the SAME fd number, which is exactly what a close +
+        later open would do by luck.
+
+        The `pinned=None` assertion at the end is the F1 regression guard in its
+        realistic setting: the parent here is this very test process, alive
+        beyond doubt, and an unpinned check used to answer "dead" -- i.e.
+        `os._exit(0)` mid-test-suite had the watchdog been the caller.
+        """
+        import multiprocessing
+        from multiprocessing.process import _ParentProcess
+
+        from cognee_db_workers import harness
+
+        r, w = os.pipe()
+        st = os.fstat(r)
+        good_identity = (st.st_dev, st.st_ino)
+        scratch = open(os.devnull, "rb")
+        try:
+            os.close(w)
+            # Recycle the fd NUMBER onto an unrelated open file description.
+            os.dup2(scratch.fileno(), r)
+            parent = _ParentProcess("MainProcess", os.getpid(), r)
+            monkeypatch.setattr(multiprocessing, "parent_process", lambda: parent)
+
+            # PREMISE: the real is_alive() calls this healthy parent dead.
+            assert parent.is_alive() is False, (
+                "premise failed: a recycled fd did not read as dead on this platform, "
+                "so the rest of this test would prove nothing"
+            )
+            # And the existing validity corroboration does NOT catch it -- the
+            # fd is perfectly valid, it is just a different file now.
+            assert harness._parent_sentinel_alive() is False
+
+            # THE PIN CATCHES IT.
+            assert harness._sentinel_confirms_parent_dead(good_identity) is False, (
+                "identity pin failed to reject a recycled fd"
+            )
+            # AND SO DOES THE ABSENCE OF A PIN. Ambiguity is never death.
+            assert harness._sentinel_confirms_parent_dead(None) is False, (
+                "unpinned check called a healthy parent dead -- this is the F1 outage"
+            )
+        finally:
+            os.close(r)
+            scratch.close()

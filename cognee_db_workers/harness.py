@@ -329,6 +329,64 @@ def get_original_parent_pid() -> Optional[int]:
     return pid if isinstance(pid, int) and pid > 0 else None
 
 
+def pdeathsig_anchor_is_real_parent() -> Optional[bool]:
+    """Does ``prctl(PR_SET_PDEATHSIG)`` anchor to the process we actually care about?
+
+    Tri-state. ``True`` = this process's OS parent IS the launching process, so
+    an armed pdeathsig fires when the real parent dies. ``False`` = they are
+    different processes, so pdeathsig is anchored to something else entirely and
+    CANNOT be relied on for parent death. ``None`` = cannot tell.
+
+    ``PR_SET_PDEATHSIG`` signals the caller when its **OS** parent — the pid
+    ``getppid()`` reports — dies, and nothing else. Under the ``forkserver``
+    start method the child's OS parent is the FORK SERVER, not the launching
+    process, and a fork server OUTLIVES a launching process that dies: it is
+    merely reparented. So the signal never arrives. Measured on this project's
+    target (WSL Ubuntu / CPython 3.14.4), launching process SIGKILLing itself
+    3s AFTER the worker reported READY — i.e. strictly after prctl armed, the
+    path ``TestNormalPathNotRegressed`` covers::
+
+        method=spawn       worker=6401  anchor=6399 == launching process
+                           RESULT: worker died 0.00s after the parent's SIGKILL
+        method=fork        worker=6406  anchor=6405 == launching process
+                           RESULT: worker died 0.10s after the parent's SIGKILL
+        method=forkserver  worker=6413  anchor=6412 != launching process 6410
+                           t= 0.0 .. 18.0  worker=alive  anchor_alive=True
+                           RESULT: SURVIVED the full 20s  <-- ORPHANED WORKER
+
+    CPython 3.14 makes ``forkserver`` the default start method on Linux, so that
+    third row is what a plain ``Process(...)`` with no explicit context gets.
+
+    DEGRADES TOWARD "UNTRUSTWORTHY" — deliberately the OPPOSITE direction from
+    ``parent_already_exited``, and the two are not in tension because nothing
+    here can kill anything. The only caller responds to a non-``True`` answer by
+    *starting an observer*; that observer's kill decision runs through
+    ``_sentinel_confirms_parent_dead``, which keeps the "ambiguity is never
+    death" invariant at the point where it can actually cost an outage. So the
+    safe default for THIS question is "assume prctl does not cover us, and watch
+    anyway"; callers must therefore test ``is not True``, not ``is False``.
+
+    Measures the ACTUAL relationship (``getppid()`` vs
+    ``multiprocessing.parent_process()``) rather than reading
+    ``get_start_method()``. That distinction is load-bearing: the getppid
+    fallback removed from ``parent_already_exited`` on 2026-07-28 was dangerous
+    precisely because it keyed on the process-wide DEFAULT context instead of
+    the context that created this child. This comparison is the property itself,
+    not a proxy for it, so it stays correct for a process that defaults to spawn
+    while launching a component via ``get_context("forkserver")``.
+    """
+    real_ppid = get_original_parent_pid()
+    if real_ppid is None:
+        # Not a multiprocessing child (direct ``run_worker_loop`` call in a test
+        # or an embedding host). No baseline exists, so no claim can be made.
+        return None
+    try:
+        os_ppid = os.getppid()
+    except Exception:
+        return None
+    return os_ppid == real_ppid
+
+
 def _parent_sentinel_alive() -> Optional[bool]:
     """Tri-state liveness of the real parent, via the multiprocessing sentinel.
 
@@ -392,6 +450,100 @@ def _parent_sentinel_alive() -> Optional[bool]:
         return False
     except Exception:
         return None
+
+
+def _parent_sentinel_identity() -> Optional[tuple]:
+    """``(st_dev, st_ino)`` of the parent-sentinel fd, or ``None``.
+
+    POSIX only: on Windows ``_sentinel`` is a process HANDLE, not a file
+    descriptor, so ``os.fstat`` on it is meaningless — ``None`` there.
+
+    Pins the sentinel to ONE open file description, the same discipline the
+    tests apply to pids via ``/proc/<pid>/stat`` ``starttime``.
+    ``_parent_sentinel_alive()`` corroborates a "dead" answer by checking the fd
+    is still VALID, which correctly rejects a CLOSED fd. It cannot reject a
+    RECYCLED one: if anything in the worker closes the sentinel fd and a later
+    ``open()`` is handed the same fd NUMBER, ``os.fstat`` succeeds, ``poll()``
+    on a regular file always reports readable, and ``is_alive()`` therefore
+    returns False for a perfectly healthy parent. As a one-shot startup check
+    that window is narrow; ``start_parent_sentinel_watchdog`` polls for the
+    worker's entire life, so the exposure stops being narrow and gets pinned
+    instead.
+
+    Measured on WSL Ubuntu / CPython 3.14.4: the sentinel is a FIFO under all
+    three start methods, its identity is stable over time, and — critically —
+    it is UNCHANGED after the parent dies (the child holds its own end of the
+    pipe open; the far end closing is what ``poll()`` reports, and does not
+    disturb ``fstat``). A pin that did not survive the parent's death would
+    silently suppress every kill and disable the fix::
+
+        spawn        sentinel_fd=5  is_fifo=True  fstat=(15, 347144)
+        fork         sentinel_fd=9  is_fifo=True  fstat=(15, 347148)
+        forkserver   sentinel_fd=4  is_fifo=True  fstat=(15, 347157)
+    """
+    if sys.platform == "win32":
+        return None
+    try:
+        import multiprocessing
+
+        parent = multiprocessing.parent_process()
+        if parent is None:
+            return None
+        sentinel = getattr(parent, "_sentinel", None)
+        if sentinel is None:
+            return None
+        st = os.fstat(sentinel)
+        return (st.st_dev, st.st_ino)
+    except Exception:
+        return None
+
+
+def _sentinel_confirms_parent_dead(pinned_identity: Optional[tuple]) -> bool:
+    """``True`` ONLY for a corroborated, identity-pinned parent death.
+
+    Every other outcome returns ``False``: parent alive, sentinel unreadable,
+    tri-state ``None``, or a sentinel fd whose identity no longer matches
+    ``pinned_identity`` (i.e. the fd number was recycled — see
+    ``_parent_sentinel_identity``). The only caller responds to ``True`` with
+    ``os._exit(0)``, so this obeys the same rule as ``parent_already_exited``:
+    ambiguity degrades to "do nothing", NEVER to "dead". A false positive here
+    is a production outage, not a missed cleanup.
+
+    ``pinned_identity is None`` means no fd identity was available to pin, so
+    the recycled-fd case CANNOT be ruled out. That is ambiguity, and ambiguity
+    returns ``False``. It is tested FIRST, before the sentinel is consulted, so
+    the invariant leads the function instead of trailing it.
+
+    CORRECTED 2026-07-29: this branch returned ``True``, which made the
+    paragraph above — the function's entire contract — false, in the one
+    direction that costs an outage. Measured with a REAL recycled fd, parent
+    alive throughout, no monkeypatching::
+
+        pin_at_watchdog_start        = None    <- fstat failed; watchdog started anyway
+        recycled_fd                  = 4       <- fd number reused by a regular file
+        parent_still_alive           = True
+        _parent_sentinel_alive()     = False   <- "confirmed dead", healthy parent
+        confirms_dead_UNPINNED(None) = True    <- KILL
+        confirms_dead_PINNED(good)   = False   <- pin correctly rejects it
+
+    A/B with the pin as the only variable: pinned survived 5s and the watchdog
+    never fired; unpinned fired at t+0.001s with ``os._exit(0)`` on a healthy
+    parent. The old justification — "never weaker than what
+    ``parent_already_exited`` does at startup" — was a category error that this
+    function's own caller refutes: ``parent_already_exited`` is ONE-SHOT at
+    startup, this POLLS FOREVER. Same reading, different exposure, so the
+    comparison never licensed the same risk.
+
+    ``start_parent_sentinel_watchdog`` independently refuses to start without a
+    pin, so the two guards are belt-and-braces: this one keeps the predicate
+    honest for any caller, that one keeps a permanently-unpinned watcher thread
+    from existing at all.
+    """
+    if pinned_identity is None:
+        return False
+    if _parent_sentinel_alive() is not False:
+        return False
+    return _parent_sentinel_identity() == pinned_identity
 
 
 def parent_already_exited(original_ppid: Optional[int]) -> bool:
@@ -487,6 +639,17 @@ def start_parent_liveness_watchdog(poll_interval: float = 1.0) -> None:
     pid 1 (cognee running as the container's entrypoint), which made the
     watchdog kill workers on their very first poll. The ppid-change check
     alone covers reparenting correctly in all cases.
+
+    BLIND UNDER ``forkserver`` — added 2026-07-29, and it is a structural limit,
+    not a bug to fix here. ``os.getppid()`` resolves to the FORK SERVER, which
+    is reparented but stays alive when the real parent dies, so this watchdog
+    sees a constant ppid and reports "parent fine" for exactly the death it is
+    supposed to catch. It is the same wrong anchor prctl uses (see
+    ``pdeathsig_anchor_is_real_parent``), so it cannot serve as prctl's fallback
+    under that start method. ``start_parent_sentinel_watchdog`` is the one that
+    covers that case; ``run_worker_loop`` starts it alongside this one whenever
+    the anchor is not the real parent. Do not read this function's "portable
+    fallback" framing as "covers every case".
     """
     import threading
 
@@ -512,6 +675,118 @@ def start_parent_liveness_watchdog(poll_interval: float = 1.0) -> None:
 
     t = threading.Thread(target=_watch, name="parent-liveness-watchdog", daemon=True)
     t.start()
+
+
+# Guards ``start_parent_sentinel_watchdog``'s one-per-process invariant. Both
+# the flag and the lock are process-local, which is exactly the right scope: a
+# spawned worker gets a fresh module import and therefore a fresh flag, while a
+# fork/forkserver child inherits ``False`` from a parent that never started one
+# (only workers do). The lock is held across the thread start so two concurrent
+# callers cannot both observe ``False`` and each start a watcher.
+_SENTINEL_WATCHDOG_LOCK = threading.Lock()
+_sentinel_watchdog_started = False
+
+
+def start_parent_sentinel_watchdog(poll_interval: float = 1.0) -> bool:
+    """Parent-liveness watchdog built on the multiprocessing sentinel.
+
+    Covers the case ``start_parent_liveness_watchdog`` structurally cannot: it
+    polls ``os.getppid()``, which under ``forkserver`` resolves to the fork
+    server — the very process prctl mis-anchors to, and which survives the real
+    parent's death. Polling it therefore reports "parent fine" for precisely the
+    death that needs detecting, so the existing fallback is not a fallback here
+    at all. This one polls the parent sentinel instead: the same kernel-held
+    signal ``parent_already_exited`` already trusts at startup, which the kernel
+    releases on ANY parent exit (clean, ``SIGKILL``, OOM), is start-method
+    agnostic, and is immune to PID reuse because it is an open-fd relationship
+    rather than a pid number.
+
+    Started by ``run_worker_loop`` whenever ``pdeathsig_anchor_is_real_parent()``
+    is not ``True``. Under ``spawn`` and ``fork`` — where the anchor IS the real
+    parent — it does not run at all, so the kernel signal keeps covering the
+    common path with no polling thread behind it.
+
+    Returns ``True`` when this process has a live sentinel watchdog — started by
+    this call, or already running from an earlier one. ``False`` means there is
+    none and none was started. Reporting that honestly is the point, and the
+    caller MUST use the value: a protection that claims success while doing
+    nothing is the exact shape ``set_pdeathsig``'s readback exists to eliminate,
+    and this function's own reason for existing is that ``set_pdeathsig``
+    returning ``True`` under forkserver is that same lie one layer down. If
+    CPython ever renames ``_sentinel``, this silently returns ``False`` and the
+    whole fix goes inert — which is precisely why ``run_worker_loop`` logs on a
+    ``False`` it did not expect rather than discarding it.
+
+    REFUSES TO START WITHOUT AN fd IDENTITY PIN (POSIX; added 2026-07-29). A
+    watcher whose ``pinned_identity`` is ``None`` can never fire — see the
+    CORRECTED note in ``_sentinel_confirms_parent_dead`` — so starting one would
+    create a thread that polls forever and cannot act: a protection that exists
+    only on paper. Declining is strictly better than that AND better than the
+    original behaviour, which was to run unpinned and treat the unpinnable
+    reading as a kill. Both guards are kept: this one prevents the state, the
+    predicate refuses to act on it.
+
+    WINDOWS IS EXCLUDED BY CONSTRUCTION, not by luck. ``_parent_sentinel_identity``
+    returns ``None`` on Windows by design (``_sentinel`` is a process HANDLE, not
+    an fd), so a Windows watcher could only ever be the unpinned kind. The
+    explicit ``win32`` guard below makes the POSIX scoping enforced rather than
+    an accident of who happens to call this — matching ``parent_already_exited``,
+    which opens with the same check for the same reason. Windows parent-death
+    handling stays entirely with ``start_parent_liveness_watchdog``.
+
+    The kill decision is delegated whole to ``_sentinel_confirms_parent_dead``,
+    which returns ``True`` only for a corroborated, identity-pinned death.
+    "Unknown" is never escalated to "dead", and it is never escalated by
+    repetition either: N consecutive unreadable polls still mean unknown, so
+    there is deliberately no consecutive-failure counter here. The response to a
+    ``True`` is ``os._exit(0)``, and a false positive is an outage.
+    """
+    if sys.platform == "win32":
+        return False
+
+    global _sentinel_watchdog_started
+    with _SENTINEL_WATCHDOG_LOCK:
+        # Idempotent: ``run_worker_loop`` is called once per worker today, but a
+        # re-entry (an embedding host reusing the process, a future respawn path
+        # that loops rather than re-execs) would otherwise accumulate a thread
+        # per call, each holding its own pin. One watcher is sufficient and the
+        # extra ones could never disagree usefully.
+        if _sentinel_watchdog_started:
+            return True
+
+        try:
+            import multiprocessing
+
+            parent = multiprocessing.parent_process()
+        except Exception:
+            return False
+        if parent is None or getattr(parent, "_sentinel", None) is None:
+            return False
+
+        # Pin the sentinel's fd identity ONCE, while the fd is known-good, so a
+        # later recycled fd number cannot be mistaken for a dead parent. See
+        # ``_parent_sentinel_identity`` for why validity alone is not enough.
+        pinned_identity = _parent_sentinel_identity()
+        if pinned_identity is None:
+            return False
+
+        def _watch() -> None:
+            while True:
+                if _sentinel_confirms_parent_dead(pinned_identity):
+                    # Parent confirmed gone; exit fast without running atexit
+                    # handlers (those may touch resources owned by the dead
+                    # parent) rather than sit forever holding an exclusive
+                    # Kuzu/LanceDB file lock.
+                    os._exit(0)
+                try:
+                    time.sleep(poll_interval)
+                except Exception:
+                    return
+
+        t = threading.Thread(target=_watch, name="parent-sentinel-watchdog", daemon=True)
+        t.start()
+        _sentinel_watchdog_started = True
+        return True
 
 
 # Serializes all ``spawn_without_main`` enter/exit transitions. The
@@ -625,6 +900,41 @@ def run_worker_loop(
     # us covered.
     if not set_pdeathsig():
         start_parent_liveness_watchdog()
+    # Closes the SECOND, distinct gap: prctl anchors to the OS parent, and under
+    # `forkserver` that is the FORK SERVER, not the launching process. The fork
+    # server merely gets reparented when the real parent dies, so pdeathsig
+    # never fires -- and the fallback above cannot cover for it, because it
+    # polls the same wrong pid. Measured: a forkserver worker survived the full
+    # 20s after its launching process was SIGKILLed, where spawn and fork both
+    # died inside 0.1s (see `pdeathsig_anchor_is_real_parent`).
+    #
+    # `is not True` rather than `is False`: the anchor check degrades to
+    # "untrustworthy" on ambiguity, because starting an observer cannot hurt --
+    # the kill decision lives inside the watchdog and degrades the other way.
+    # Under spawn/fork the anchor IS the real parent, so this does not run and
+    # the kernel signal keeps covering the common path unassisted.
+    if pdeathsig_anchor_is_real_parent() is not True:
+        # The return value is CONSUMED, not discarded. This is the one call site
+        # that knows the watchdog was actually wanted here, so it is the only
+        # place that can tell "declined, nothing to watch" apart from "declined,
+        # and we are now unprotected". If a future CPython renames `_sentinel`,
+        # or the fd cannot be pinned, this fix goes inert -- silently, with every
+        # test still green except one. A worker with no parent-death protection
+        # is exactly the orphaned-DB-lock outage, so it says so on stderr rather
+        # than failing open in silence. Windows is excluded by construction (see
+        # the function), so a False there is expected and not worth a line.
+        if not start_parent_sentinel_watchdog() and sys.platform != "win32":
+            try:
+                print(
+                    "[cognee_db_workers] pdeathsig is anchored to a process that is "
+                    "not the real parent (forkserver), and the sentinel watchdog "
+                    "could not start: no pinnable parent sentinel. This worker has "
+                    "NO parent-death protection and may orphan holding a DB lock.",
+                    file=sys.__stderr__ or sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
     # Closes the arm-time race that NEITHER branch above can:
     # every one of them only reacts to a parent death occurring after it is
     # installed, but the parent can already be gone by the time this line is
