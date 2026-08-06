@@ -39,8 +39,16 @@ async def visualize_graph(
     neighborhood_depth: int = DEFAULT_NEIGHBORHOOD_DEPTH,
     neighborhood_seed_top_k: int = DEFAULT_SEED_TOP_K,
     max_nodes: int = DEFAULT_MAX_NODES,
+    inline_assets: bool = False,
 ) -> str:
-    """Render the knowledge graph to a self-contained HTML file.
+    """Render the knowledge graph to an HTML file.
+
+    The page is self-contained -- no external network calls at view time --
+    only when ``inline_assets=True``. By default (``inline_assets=False``,
+    unchanged from every prior release) it loads D3 from https://d3js.org and
+    Google Fonts from fonts.googleapis.com, so it renders blank under a
+    strict Content-Security-Policy or with no internet access; pass
+    ``inline_assets=True`` for a page that works in those environments.
 
     By default renders a bounded subgraph around relevant seed nodes rather than
     the entire graph. Seeds are chosen by priority: ``seed_node_ids`` >
@@ -73,6 +81,12 @@ async def visualize_graph(
         neighborhood_depth: k-hop expansion depth around the seeds (default 2).
         neighborhood_seed_top_k: Maximum number of seed nodes (default 10).
         max_nodes: Hard cap on rendered nodes after expansion (default 500).
+        inline_assets: When True, inlines the vendored D3 v7.9.0 source
+            directly into the page and drops the Google Fonts links instead
+            of loading them from a CDN, producing a genuinely self-contained
+            HTML file with zero external network dependencies. Defaults to
+            False, which preserves the pre-existing CDN-based rendering for
+            every existing caller.
     """
     if not user:
         user = await get_default_user()
@@ -107,7 +121,10 @@ async def visualize_graph(
             search_events = await collect_session_events(user=user, session_ids=session_ids)
 
         graph = await cognee_network_visualization(
-            graph_data, destination_file_path, search_events=search_events
+            graph_data,
+            destination_file_path,
+            search_events=search_events,
+            inline_assets=inline_assets,
         )
 
         if destination_file_path:

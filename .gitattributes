@@ -3,3 +3,8 @@ notebooks/** linguist-vendored
 
 # Ensure shell scripts always use LF line endings (fixes Docker on Windows)
 *.sh text eol=lf
+
+# Vendored third-party bundle: keep byte-for-byte identical to the upstream
+# d3.v7.min.js release on every platform. Never let git normalize line
+# endings on it (a Windows checkout would otherwise rewrite LF -> CRLF).
+cognee/modules/visualization/vendor/d3.v7.min.js -text
