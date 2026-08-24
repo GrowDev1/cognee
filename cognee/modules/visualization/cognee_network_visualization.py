@@ -18,6 +18,7 @@ caller of ``cognee_network_visualization`` or
 ``aggregate_multi_user_graphs`` continues to work without change.
 """
 
+import functools
 import json
 import os
 from dataclasses import asdict
@@ -136,11 +137,40 @@ def build_brain_summary_payload(dataset_name: str, graph_data) -> dict:
 
 _TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "template.html")
 
+# D3 is vendored (v7.9.0, ISC license -- see licenses/d3-LICENSE and NOTICE.md)
+# so a self-contained render never has to reach the network to fetch it.
+_VENDORED_D3_PATH = os.path.join(os.path.dirname(__file__), "vendor", "d3.v7.min.js")
+
+_CDN_D3_SCRIPT_TAG = '<script src="https://d3js.org/d3.v7.min.js"></script>'
+_GOOGLE_FONTS_LINKS = (
+    '<link rel="preconnect" href="https://fonts.googleapis.com">\n'
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n'
+    '<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" '
+    'rel="stylesheet">'
+)
+
 
 def _safe_json_embed(obj) -> str:
     """JSON-encode while neutralising ``</`` so the result is safe to
     embed inside a ``<script>`` element."""
     return json.dumps(obj).replace("</", "<\\/")
+
+
+def _safe_script_embed(js_src: str) -> str:
+    """Neutralise ``</`` so raw JS source is safe to embed inside a
+    ``<script>`` element -- same reasoning and same fix as
+    ``_safe_json_embed``: an unescaped ``</script`` sequence anywhere in the
+    payload would close the surrounding tag early and truncate everything
+    that follows it in the page."""
+    return js_src.replace("</", "<\\/")
+
+
+@functools.lru_cache(maxsize=1)
+def _read_vendored_d3() -> str:
+    """Read the vendored D3 bundle from package data. Cached: it's static
+    content read from disk, not re-read on every render."""
+    with open(_VENDORED_D3_PATH, "r", encoding="utf-8") as f:
+        return f.read()
 
 
 def _read_template() -> str:
@@ -153,8 +183,9 @@ async def cognee_network_visualization(
     destination_file_path: Optional[str] = None,
     schema_data: Optional[dict] = None,
     search_events: Optional[list] = None,
+    inline_assets: bool = False,
 ) -> str:
-    """Render the graph to a self-contained HTML file and return the HTML.
+    """Render the graph to an HTML file and return the HTML.
 
     Args:
         graph_data: ``(nodes_data, edges_data)`` tuple as produced by
@@ -184,6 +215,15 @@ async def cognee_network_visualization(
             =True)`` collects these automatically from the session layer via
             ``cognee.modules.visualization.session_events``; pass them
             explicitly only for custom pipelines.
+        inline_assets: When False (default), the page loads D3 from
+            https://d3js.org and Google Fonts from fonts.googleapis.com --
+            matching every prior release, so no existing caller changes
+            behavior. When True, the vendored D3 v7.9.0 source is inlined
+            directly into the page and the Google Fonts links are dropped
+            (the template's CSS already declares a system-font fallback
+            stack, so this changes typeface only, not layout); the result
+            has zero external network dependencies and renders under a
+            strict Content-Security-Policy or fully offline.
 
     Returns:
         The full HTML as a string.
@@ -194,6 +234,17 @@ async def cognee_network_visualization(
     semantic_positions, semantic_clusters = await _semantic_payload(pre)
 
     html = _read_template()
+
+    # 0) Head assets: CDN by default (unchanged behavior); vendored + inlined
+    #    when inline_assets=True so the page has no external network calls.
+    if inline_assets:
+        d3_script_tag = f"<script>{_safe_script_embed(_read_vendored_d3())}</script>"
+        google_fonts_links = ""
+    else:
+        d3_script_tag = _CDN_D3_SCRIPT_TAG
+        google_fonts_links = _GOOGLE_FONTS_LINKS
+    html = html.replace("__D3_SCRIPT_TAG__", d3_script_tag)
+    html = html.replace("__GOOGLE_FONTS_LINKS__", google_fonts_links)
 
     # 1) JS chunks: ordered so the first script block (ui_chrome + schema)
     #    runs before the main story-view IIFE in the second block.

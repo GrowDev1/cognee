@@ -146,6 +146,7 @@ async def visualize_graph(
     neighborhood_depth: int = DEFAULT_NEIGHBORHOOD_DEPTH,
     neighborhood_seed_top_k: int = DEFAULT_SEED_TOP_K,
     max_nodes: int = DEFAULT_MAX_NODES,
+    inline_assets: bool = False,
 ) -> str:
     """Render the knowledge graph to a self-contained HTML file.
 
@@ -162,6 +163,10 @@ async def visualize_graph(
             spotlights, rated answers as reinforcement (improve) events.
             Collection never fails the render; an unavailable session layer
             simply yields no events.
+        inline_assets: When True, inline the vendored D3 source and drop the
+            Google Fonts links, so the page needs no network at all. Default
+            False keeps the existing CDN behaviour, so nothing changes for
+            callers that do not ask for it.
         session_ids: Restrict event collection to these sessions. Defaults to
             the user's most recently active sessions.
         user: User whose sessions are read. Defaults to the default user.
@@ -196,7 +201,10 @@ async def visualize_graph(
     )
 
     graph = await cognee_network_visualization(
-        graph_data, destination_file_path, search_events=search_events
+        graph_data,
+        destination_file_path,
+        search_events=search_events,
+        inline_assets=inline_assets,
     )
 
     if destination_file_path:
